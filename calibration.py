@@ -1,57 +1,33 @@
-
 import cv2
+import yaml
 import numpy as np
-import glob
-import os
 
-# Settings
-CHECKERBOARD = (9, 6)  # Number of inner corners in checkerboard 
-SQUARE_SIZE = 0.025  # Size of one square in meters
+def load_ros_yaml(yaml_path):
+    """
+    Loads a ROS-style YAML calibration file and returns K, D, R, P.
+    """
+    with open(yaml_path, "r") as f:
+        calib = yaml.safe_load(f)
+    K = np.array(calib["camera_matrix"]["data"]).reshape(3, 3)
+    D = np.array(calib["distortion_coefficients"]["data"])
+    R = np.array(calib["rectification_matrix"]["data"]).reshape(3, 3)
+    P = np.array(calib["projection_matrix"]["data"]).reshape(3, 4)
+    return K, D, R, P
 
-def calibrate_stereo(left_folder, right_folder, output_file):
-    # Prepare object points
-    objp = np.zeros((CHECKERBOARD[0]*CHECKERBOARD[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2)
-    objp *= SQUARE_SIZE
+def load_stereo_calibration(left_yaml, right_yaml, image_size):
+    """
+    Loads stereo calibration from left/right YAML files, creates rectification maps,
+    and computes stereo baseline from the projection matrices.
+    """
+    K1, D1, R1, P1 = load_ros_yaml(left_yaml)
+    K2, D2, R2, P2 = load_ros_yaml(right_yaml)
 
-    objpoints = []
-    imgpoints_left = []
-    imgpoints_right = []
+    left_map1, left_map2 = cv2.initUndistortRectifyMap(
+        K1, D1, R1, P1[:3, :3], image_size, cv2.CV_16SC2)
+    right_map1, right_map2 = cv2.initUndistortRectifyMap(
+        K2, D2, R2, P2[:3, :3], image_size, cv2.CV_16SC2)
 
-    left_images = sorted(glob.glob(os.path.join(left_folder, "*.jpg")))
-    right_images = sorted(glob.glob(os.path.join(right_folder, "*.jpg")))
+    # Compute baseline: Tx/fx
+    baseline = abs(P2[0, 3]) / P2[0, 0]
 
-    assert len(left_images) == len(right_images), "Number of left and right images must match!"
-
-    for left_img_path, right_img_path in zip(left_images, right_images):
-        img_left = cv2.imread(left_img_path)
-        img_right = cv2.imread(right_img_path)
-
-        gray_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
-        gray_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
-
-        ret_left, corners_left = cv2.findChessboardCorners(gray_left, CHECKERBOARD)
-        ret_right, corners_right = cv2.findChessboardCorners(gray_right, CHECKERBOARD)
-
-        if ret_left and ret_right:
-            objpoints.append(objp)
-            imgpoints_left.append(corners_left)
-            imgpoints_right.append(corners_right)
-
-    # Calibrate individual cameras
-    ret_l, K1, D1, rvecs_l, tvecs_l = cv2.calibrateCamera(objpoints, imgpoints_left, gray_left.shape[::-1], None, None)
-    ret_r, K2, D2, rvecs_r, tvecs_r = cv2.calibrateCamera(objpoints, imgpoints_right, gray_right.shape[::-1], None, None)
-
-#(x,y)=K⋅[R∣t]⋅P
-
-    # Stereo calibration
-    flags = cv2.CALIB_FIX_INTRINSIC
-    ret, K1, D1, K2, D2, R, T, E, F = cv2.stereoCalibrate(
-        objpoints, imgpoints_left, imgpoints_right, K1, D1, K2, D2, gray_left.shape[::-1], flags=flags
-    )
-
-    np.savez(output_file, K1=K1, D1=D1, K2=K2, D2=D2, R=R, T=T)
-    print(f"Calibration saved to {output_file}")
-
-if __name__ == "__main__":
-    calibrate_stereo("calib_images/left", "calib_images/right", "stereo_calib.npz")
+    return K1, left_map1, left_map2, right_map1, right_map2, baseline
