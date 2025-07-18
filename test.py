@@ -81,6 +81,11 @@
 
 
 # --- Same imports as before ---
+# Updated version of your script with:
+# 1. Confidence filtering for matches
+# 2. Patch-based recovery using pose transformations
+# 3. Debug visualizations to inspect patch replacements
+
 import cv2
 import glob
 import numpy as np
@@ -109,14 +114,10 @@ if len(left_images) == 0 or len(right_images) == 0:
 output_dir = "Dataset/gt_stereo/output"
 os.makedirs(output_dir, exist_ok=True)
 
-feature_history = {}
 trajectory = []
-
-HSV_V_THRESHOLD = 200
-DILATION_KERNEL_SIZE = 5
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (DILATION_KERNEL_SIZE, DILATION_KERNEL_SIZE))
-
-prev_kp, prev_des, prev_mask, prev_frame = None, None, None, None
+patch_size = 35
+corrected_pixels_per_frame = []
+prev_kp, prev_des, prev_mask_updated, prev_frame_hsv, prev_pose, prev_depth = None, None, None, None, None, None
 pose_prev = np.eye(4)
 video_writer = None
 
@@ -137,67 +138,105 @@ for idx, (left_path, right_path) in enumerate(zip(left_images, right_images)):
     trajectory.append(pose_now[:3, 3].copy())
 
     hsv = cv2.cvtColor(rect_left, cv2.COLOR_BGR2HSV)
-    _, mask = cv2.threshold(hsv[:, :, 2], HSV_V_THRESHOLD, 255, cv2.THRESH_BINARY)
-    mask_dilated = cv2.dilate(mask, kernel, iterations=1)
+    current_frame_hsv = hsv.copy()
+    _, mask = cv2.threshold(hsv[:, :, 2], 200, 255, cv2.THRESH_BINARY)
+    mask_dilated = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
     mask_curr_bin = (mask_dilated > 127).astype(np.uint8)
 
-    h, w = mask_curr_bin.shape
-    current_frame = rect_left.copy()
+    corrected_pixel_count = 0
 
-    if prev_kp is not None and prev_des is not None and prev_mask is not None and prev_frame is not None:
+    if prev_kp is not None and prev_des is not None and prev_mask_updated is not None and prev_frame_hsv is not None and prev_pose is not None and prev_depth is not None:
         matches = bf.match(prev_des, des)
 
-        if len(matches) > 0:
-            match_img = cv2.drawMatches(prev_frame, prev_kp, current_frame, kp, matches[:50], None, flags=2)
+        distances = np.array([m.distance for m in matches])
+        threshold = np.percentile(distances, 50)
+        confident_matches = [m for m in matches if m.distance <= threshold]
+        print(f"[CONFIDENCE] {len(confident_matches)}/{len(matches)} matches retained after filtering")
+
+        if len(confident_matches) > 0:
+            match_img = cv2.drawMatches(cv2.cvtColor(prev_frame_hsv, cv2.COLOR_HSV2BGR), prev_kp,
+                                        cv2.cvtColor(current_frame_hsv, cv2.COLOR_HSV2BGR), kp,
+                                        confident_matches[:50], None, flags=2)
             cv2.imshow("Feature Matches", match_img)
 
-        for m in matches:
+        T = np.linalg.inv(prev_pose) @ pose_now
+        warped_prev_mask = np.zeros_like(mask_curr_bin)
+        h, w = mask_curr_bin.shape
+        ys, xs = np.nonzero(prev_mask_updated)
+        for y, x in zip(ys, xs):
+            z = prev_depth[y, x]
+            if not np.isfinite(z) or z < 0.1 or z > 100.0:
+                continue
+            pt_cam = np.array([
+                (x - K1[0, 2]) * z / K1[0, 0],
+                (y - K1[1, 2]) * z / K1[1, 1],
+                z,
+                1.0
+            ])
+            pt_cam_curr = T @ pt_cam
+            u = int(K1[0, 0] * pt_cam_curr[0] / pt_cam_curr[2] + K1[0, 2])
+            v = int(K1[1, 1] * pt_cam_curr[1] / pt_cam_curr[2] + K1[1, 2])
+            if 0 <= u < w and 0 <= v < h:
+                warped_prev_mask[v, u] = 1
+
+        newly_occluded = (mask_curr_bin == 1) & (warped_prev_mask == 0)
+        debug_newly_occluded_mask = (newly_occluded * 255).astype(np.uint8)
+        cv2.namedWindow("Newly Occluded Pixels Mask (B ∩ (¬Warp(A_updated) → B))", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Newly Occluded Pixels Mask (B ∩ (¬Warp(A_updated) → B))", 800, 600)
+        cv2.imshow("Newly Occluded Pixels Mask (B ∩ (¬Warp(A_updated) → B))", debug_newly_occluded_mask)
+
+        for m in confident_matches:
             prev_pt = np.round(prev_kp[m.queryIdx].pt).astype(int)
             curr_pt = np.round(kp[m.trainIdx].pt).astype(int)
+
             if not (0 <= curr_pt[0] < w and 0 <= curr_pt[1] < h): continue
-            if not (0 <= prev_pt[0] < w and 0 <= prev_pt[1] < h): continue
+            if not newly_occluded[curr_pt[1], curr_pt[0]]: continue
 
-            prev_caustic = prev_mask[prev_pt[1], prev_pt[0]] > 0
-            curr_caustic = mask_curr_bin[curr_pt[1], curr_pt[0]] > 0
-            feature_id = hash((prev_pt[0], prev_pt[1]))
+            z = depth_map[curr_pt[1], curr_pt[0]]
+            if not np.isfinite(z) or z < 0.1 or z > 100.0:
+                continue
+            pt_cam = np.array([
+                (curr_pt[0] - K1[0, 2]) * z / K1[0, 0],
+                (curr_pt[1] - K1[1, 2]) * z / K1[1, 1],
+                z,
+                1.0
+            ])
+            pt_cam_prev = T @ pt_cam
+            u = int(K1[0, 0] * pt_cam_prev[0] / pt_cam_prev[2] + K1[0, 2])
+            v = int(K1[1, 1] * pt_cam_prev[1] / pt_cam_prev[2] + K1[1, 2])
 
-            if not prev_caustic and curr_caustic:
-                if feature_history.get(feature_id) is not None:
-                    current_frame[curr_pt[1], curr_pt[0]] = feature_history[feature_id]
-                else:
-                    current_frame[curr_pt[1], curr_pt[0]] = [0, 0, 0]
+            if 0 <= u < w - patch_size and 0 <= v < h - patch_size:
+                patch = prev_frame_hsv[v:v+patch_size, u:u+patch_size].copy()
+                current_frame_hsv[curr_pt[1]-patch_size//2:curr_pt[1]+patch_size//2+1,
+                                  curr_pt[0]-patch_size//2:curr_pt[0]+patch_size//2+1] = patch
 
-            if not curr_caustic:
-                feature_history[feature_id] = current_frame[curr_pt[1], curr_pt[0]].copy()
+                cv2.rectangle(current_frame_hsv,
+                              (curr_pt[0]-patch_size//2, curr_pt[1]-patch_size//2),
+                              (curr_pt[0]+patch_size//2, curr_pt[1]+patch_size//2),
+                              (30,255,255), 1)  # HSV yellow border
 
-        newly_occluded = (mask_curr_bin == 1) & (prev_mask == 0)
-        debug_newly_occluded_mask = np.zeros_like(mask_curr_bin, dtype=np.uint8)
-        debug_newly_occluded_mask[newly_occluded] = 255
-        cv2.namedWindow("Newly Occluded Pixels Mask (A ∩ (A - B))", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Newly Occluded Pixels Mask (A ∩ (A - B))", 800, 600)
-        cv2.imshow("Newly Occluded Pixels Mask (A ∩ (A - B))", debug_newly_occluded_mask)
+                mask_curr_bin[curr_pt[1]-patch_size//2:curr_pt[1]+patch_size//2+1,
+                              curr_pt[0]-patch_size//2:curr_pt[0]+patch_size//2+1] = 0
 
-    cv2.imshow("Current Frame with Stable Replacements", current_frame)
-    cv2.imshow("Raw Caustic Mask (Current Frame)", mask)
-    cv2.imshow("Dilated Caustic Mask", mask_dilated)
-    debug_combined_mask = (mask_curr_bin * 255).astype(np.uint8)
-    cv2.imshow("Current Caustic Mask", debug_combined_mask)
+                corrected_pixel_count += patch_size * patch_size
 
-    print(f"[INFO] Frame {idx}: matches={len(matches) if prev_des is not None else 0}, stable_features={len(feature_history)}")
+    corrected_pixels_per_frame.append(corrected_pixel_count)
+
+    current_frame_bgr = cv2.cvtColor(current_frame_hsv, cv2.COLOR_HSV2BGR)
+    cv2.imshow("Current Frame with Stable Replacements", current_frame_bgr)
+    cv2.imshow("Current Caustic Mask", (mask_curr_bin*255).astype(np.uint8))
 
     output_path = os.path.join(output_dir, f"frame_{idx:04d}.png")
-    cv2.imwrite(output_path, current_frame)
+    cv2.imwrite(output_path, current_frame_bgr)
 
     if video_writer is None:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(
-            os.path.join(output_dir, "caustic_removed.mp4"),
-            fourcc, 10, (current_frame.shape[1], current_frame.shape[0]))
-    video_writer.write(current_frame)
+            os.path.join(output_dir, "caustic_removed_patch_based.mp4"),
+            fourcc, 10, (current_frame_bgr.shape[1], current_frame_bgr.shape[0]))
+    video_writer.write(current_frame_bgr)
 
-    prev_kp, prev_des, prev_mask, prev_frame = kp, des, mask_curr_bin.copy(), rect_left.copy()
-    pose_prev = pose_now.copy()
-
+    prev_kp, prev_des, prev_mask_updated, prev_frame_hsv, prev_pose, prev_depth = kp, des, mask_curr_bin.copy(), current_frame_hsv.copy(), pose_now.copy(), depth_map.copy()
     key = cv2.waitKey(1)
     if key & 0xFF == ord('q'):
         break
@@ -219,3 +258,11 @@ ax.set_title("Estimated Camera Trajectory")
 ax.legend()
 plt.show()
 
+plt.figure(figsize=(10,4))
+plt.plot(corrected_pixels_per_frame, marker='o')
+plt.title("Number of Corrected Pixels per Frame")
+plt.xlabel("Frame Index")
+plt.ylabel("Corrected Pixels")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
