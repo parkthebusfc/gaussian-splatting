@@ -11,12 +11,16 @@ frame_width = 1920
 num_frames = 30
 caustic_v_threshold = 200
 
+video_path = os.path.join(output_dir, "synthetic_output.mp4")
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+fps = 10
+video_writer = cv2.VideoWriter(video_path, fourcc, fps, (frame_width, frame_height))
+
 
 def create_base_frame():
     hsv = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-    hsv[..., 0] = 60      # green hue
-    hsv[..., 1] = 255     # full saturation
-    hsv[..., 2] = 80      # low V (dark background)
+    hsv[..., 1] = 0     # Saturation = 0 (grayscale)
+    hsv[..., 2] = 30    # Low V = very dark (almost black)
 
     # Add non-caustic stable shapes
     for i in range(5):
@@ -48,11 +52,17 @@ for i in range(num_frames):
 
     # Simulate rightward movement
     M = np.float32([[1, 0, i * 5], [0, 1, 0]])
-    translated = cv2.warpAffine(base, M, (frame_width, frame_height), borderValue=(60, 255, 80))
+    translated = cv2.warpAffine(base, M, (frame_width, frame_height), borderValue=(0, 0, 30))
 
     frame_with_caustics = add_caustics(translated.copy())
 
     bgr_frame = cv2.cvtColor(frame_with_caustics, cv2.COLOR_HSV2BGR)
-    cv2.imwrite(os.path.join(output_dir, f"frame_{i:04d}.png"), bgr_frame)
+    filename = os.path.join(output_dir, f"frame_{i:04d}.png")
+    cv2.imwrite(filename, bgr_frame)
+    video_writer.write(bgr_frame)
 
+    print(f"[INFO] Saved {filename}")
+
+video_writer.release()
 print(f"[INFO] Synthetic frames saved to: {output_dir}")
+print(f"[INFO] MP4 video saved to: {video_path}")
